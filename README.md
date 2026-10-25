@@ -2,6 +2,8 @@
 
 [Official Website](https://spool-sync.com/)
 
+> **FTFY-Software fork:** this fork adds an installation wizard (`install.sh`) and expanded install and configuration docs. These changes are proposed upstream at [Spool-Sync/SpoolSync-App](https://github.com/Spool-Sync/SpoolSync-App).
+
 **SpoolSync** is an advanced, user-friendly filament management platform for 3D printing enthusiasts and print farms. It provides real-time tracking, inventory management, and seamless integration with printers and hardware, all in a self-hosted, privacy-first package.
 
 ![Dashboard](docs/screenshots/dashboard.png)
@@ -88,7 +90,7 @@
 You need a host with Docker and the Compose plugin, and a user that can run `docker` without `sudo`.
 
 ```sh
-git clone https://github.com/Spool-Sync/SpoolSync-App.git
+git clone https://github.com/FTFY-Software/SpoolSync-App.git
 cd SpoolSync-App
 ./install.sh
 ```

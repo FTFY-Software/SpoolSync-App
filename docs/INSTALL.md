@@ -40,7 +40,7 @@ ESP32 spool holders ────────────────────
 ## Quick install (wizard)
 
 ```sh
-git clone https://github.com/Spool-Sync/SpoolSync-App.git
+git clone https://github.com/FTFY-Software/SpoolSync-App.git
 cd SpoolSync-App
 ./install.sh
 ```
@@ -81,7 +81,7 @@ Run `./install.sh --help` for the full list of presettable variables.
 ## Manual install
 
 ```sh
-git clone https://github.com/Spool-Sync/SpoolSync-App.git
+git clone https://github.com/FTFY-Software/SpoolSync-App.git
 cd SpoolSync-App
 cp .env.example .env
 ```
