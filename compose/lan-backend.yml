@@ -1,0 +1,10 @@
+# Also put the backend API on the LAN network, so ESP32 spool holders reach it
+# at BACKEND_LAN_IP:3000. Load after compose/lan-network.yml, which defines
+# the network. The database stays on the private project network.
+services:
+  backend:
+    ports: !reset []
+    networks:
+      default: {}
+      lan:
+        ipv4_address: ${BACKEND_LAN_IP:?set BACKEND_LAN_IP in .env}
