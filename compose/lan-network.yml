@@ -1,0 +1,17 @@
+# Give the web UI its own address on an existing LAN network (macvlan/ipvlan).
+# The container stays on the project network to reach the backend, and its
+# host port mapping is removed: it listens on FRONTEND_LAN_IP:80 directly.
+# Enable with COMPOSE_FILE=docker-compose.yml:compose/lan-network.yml.
+# Requires Docker Compose 2.24+ (for !reset).
+services:
+  frontend:
+    ports: !reset []
+    networks:
+      default: {}
+      lan:
+        ipv4_address: ${FRONTEND_LAN_IP:?set FRONTEND_LAN_IP in .env}
+
+networks:
+  lan:
+    name: ${LAN_NETWORK:-lan}
+    external: true

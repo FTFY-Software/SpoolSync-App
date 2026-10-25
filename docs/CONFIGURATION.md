@@ -47,6 +47,61 @@ Inside the Compose network the backend always listens on `3000`, and nginx
 always reaches it at `backend:3000`. These settings only change the
 published host ports.
 
+### LAN networking (macvlan / ipvlan)
+
+Some hosts put containers directly on the LAN through a Docker `macvlan` or
+`ipvlan` network. Each container then has its own MAC and LAN IP, and port
+publishing is not used. SpoolSync supports this as an alternative to host
+ports:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SPOOLSYNC_NETWORK_MODE` | `host` | `host` publishes ports on the host (above). `lan` gives the web UI (and optionally the API) its own LAN address. Used by `install.sh`; Compose itself follows `COMPOSE_FILE`. |
+| `LAN_NETWORK` | `lan` | Name of the existing macvlan/ipvlan Docker network to join. It must already exist; SpoolSync does not create it. |
+| `FRONTEND_LAN_IP` | — | Fixed LAN address of the web UI, which listens on port **80** there. |
+| `BACKEND_LAN_IP` | — | Fixed LAN address of the backend API, which listens on port **3000** there. Set `ESP32_SERVER_HOST` to the same IP. |
+
+Enable it with the overlays (`lan-backend.yml` is optional and needs
+`lan-network.yml` before it; Compose 2.24+):
+
+```sh
+SPOOLSYNC_NETWORK_MODE='lan'
+LAN_NETWORK='lan'
+FRONTEND_LAN_IP='10.71.76.254'
+BACKEND_LAN_IP='10.71.76.253'
+ESP32_SERVER_HOST='10.71.76.253'
+COMPOSE_FILE='docker-compose.yml:compose/lan-network.yml:compose/lan-backend.yml'
+COMPOSE_PATH_SEPARATOR=':'
+```
+
+How it works:
+
+- The web UI and API join the LAN network **and** keep the private project
+  network, which they use to reach each other and the database. Postgres is
+  never put on the LAN.
+- Their `ports:` mappings are removed, and the `*_BIND`/`*_PORT` settings are
+  ignored for services on the LAN. If the API isn't on the LAN, it stays
+  published on the host as configured (the wizard binds it to `127.0.0.1`).
+- Addresses are **fixed**, so bookmarks and ESP32 devices keep working when
+  containers are recreated. Pick them inside the network's subnet, and
+  preferably inside its `--ip-range`, so nothing else on the LAN (like the
+  router's DHCP pool) can hand them out. The wizard reads the subnet, range,
+  gateway and reserved (`--aux-address`) addresses from Docker. It rejects
+  addresses in use by other containers or answering a ping, and suggests free
+  ones from the top of the range, because Docker allocates automatic
+  addresses from the bottom.
+- With macvlan, the host itself cannot reach its containers unless it has a
+  shim interface (a macvlan on the same parent with a route to the
+  containers' range). Other LAN devices are unaffected. The wizard warns when
+  no such route exists. Its own checks run inside the containers, so they
+  work either way.
+- Containers attached to two networks get one default route. It's usually
+  the LAN gateway, so outbound traffic (e.g. the filament database) leaves
+  through the LAN rather than the host's NAT.
+
+To switch back, re-run the wizard and answer *no* to the LAN question, or
+remove the LAN overlays from `COMPOSE_FILE` and run `docker compose up -d`.
+
 ### Database
 
 | Variable | Default | Description |

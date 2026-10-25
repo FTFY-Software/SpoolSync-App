@@ -52,6 +52,7 @@ Options:
 Presettable variables:
   SPOOLSYNC_HOSTNAME FRONTEND_BIND FRONTEND_PORT BACKEND_BIND BACKEND_PORT
   ESP32_SERVER_HOST PUBLIC_URL
+  SPOOLSYNC_NETWORK_MODE (host|lan) LAN_NETWORK FRONTEND_LAN_IP BACKEND_LAN_IP
   SPOOLSYNC_DB_MODE (bundled|external) POSTGRES_HOST POSTGRES_PORT POSTGRES_DB
   POSTGRES_USER POSTGRES_PASSWORD POSTGRES_PUBLISH (y|n) POSTGRES_PUBLISH_BIND
   POSTGRES_PUBLISH_PORT
@@ -306,6 +307,109 @@ version_ge() { # a b → a >= b
   printf '%s\n%s\n' "$2" "$1" | sort -V -C
 }
 
+in_list() { # needle items…
+  local needle="$1" item
+  shift
+  for item in "$@"; do [[ $item == "$needle" ]] && return 0; done
+  return 1
+}
+
+# ── LAN (macvlan/ipvlan) networks ────────────────────────────────────────────
+# Containers on such a network get their own LAN address, so they listen on
+# that IP directly instead of through published host ports.
+ip2int() {
+  local IFS=. o
+  read -r -a o <<<"$1"
+  echo $(( (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3] ))
+}
+int2ip() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"; }
+cidr_bounds() { # a.b.c.d/n → "network broadcast" as integers
+  local base mask bits="${1#*/}"
+  base=$(ip2int "${1%/*}")
+  mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  echo "$(( base & mask )) $(( (base & mask) | (~mask & 0xFFFFFFFF) ))"
+}
+in_cidr() { # ip cidr
+  local n first last
+  n=$(ip2int "$1")
+  read -r first last < <(cidr_bounds "$2")
+  (( n >= first && n <= last ))
+}
+
+lan_networks() {
+  docker network ls --format '{{.Name}} {{.Driver}}' | awk '$2 == "macvlan" || $2 == "ipvlan" { print $1 }'
+}
+
+# Sets LAN_SUBNET, LAN_RANGE, LAN_GATEWAY and LAN_PARENT ("-" when unset),
+# LAN_TAKEN (gateway, Docker-reserved and other containers' addresses) and
+# LAN_OURS (addresses this stack's containers already hold).
+LAN_TAKEN=(); LAN_OURS=(); LAN_CHOSEN=()
+load_lan_network() {
+  local name="$1" cname cip aux=()
+  read -r LAN_SUBNET LAN_RANGE LAN_GATEWAY < <(
+    docker network inspect "$name" \
+      --format '{{range .IPAM.Config}}{{println .Subnet (or .IPRange "-") (or .Gateway "-")}}{{end}}' \
+      | grep -v ':' | head -n 1)
+  [[ -n ${LAN_SUBNET:-} ]] || die "Network $name has no IPv4 subnet"
+  LAN_PARENT="$(docker network inspect "$name" --format '{{or (index .Options "parent") "-"}}')"
+  LAN_TAKEN=()
+  [[ $LAN_GATEWAY != - ]] && LAN_TAKEN+=("$LAN_GATEWAY")
+  read -r -a aux < <(docker network inspect "$name" \
+    --format '{{range .IPAM.Config}}{{range $k, $v := .AuxiliaryAddresses}}{{$v}} {{end}}{{end}}') || true # no trailing newline
+  LAN_TAKEN+=("${aux[@]}")
+  LAN_OURS=()
+  while read -r cname cip; do
+    [[ -n ${cip:-} ]] || continue
+    cip="${cip%/*}"
+    if [[ $cname == "$PROJECT"-* ]]; then LAN_OURS+=("$cip"); else LAN_TAKEN+=("$cip"); fi
+  done < <(docker network inspect "$name" --format '{{range .Containers}}{{println .Name .IPv4Address}}{{end}}')
+}
+
+answers_ping() {
+  command -v ping >/dev/null 2>&1 && ping -c 1 -W 1 "$1" >/dev/null 2>&1
+}
+
+v_lan_network() {
+  in_list "$1" "${LAN_NETS[@]}" || { echo "must be one of: ${LAN_NETS[*]}"; return 1; }
+}
+
+v_lan_ip() {
+  local n first last
+  v_bind "$1" >/dev/null || { echo "must be an IPv4 address"; return 1; }
+  n=$(ip2int "$1")
+  read -r first last < <(cidr_bounds "$LAN_SUBNET")
+  (( n > first && n < last )) || { echo "must be a host address inside $LAN_SUBNET"; return 1; }
+  if in_list "$1" "${LAN_TAKEN[@]}" "${HOST_IPS[@]}" "${LAN_CHOSEN[@]}"; then
+    echo "is already used or reserved on this network"; return 1
+  fi
+  # This stack's own containers answer pings on re-runs; that's fine.
+  if ! in_list "$1" "${LAN_OURS[@]}" && answers_ping "$1"; then
+    echo "already answers on the network (another device is using it)"; return 1
+  fi
+}
+
+# Free address from the top of the automatic range (or subnet), away from
+# Docker's own allocations, which start at the bottom.
+suggest_lan_ip() {
+  local first last n tries=0
+  read -r first last < <(cidr_bounds "$([[ $LAN_RANGE != - ]] && echo "$LAN_RANGE" || echo "$LAN_SUBNET")")
+  for (( n = last - 1; n > first && tries < 40; n--, tries++ )); do
+    if v_lan_ip "$(int2ip "$n")" >/dev/null; then int2ip "$n"; return; fi
+  done
+}
+
+ask_lan_ip() { # NAME "Question"
+  local def
+  def="$(default_for "$1" '')"
+  [[ -n $def ]] || def="$(suggest_lan_ip)"
+  ask "$1" "$2" "$def" v_lan_ip
+  LAN_CHOSEN+=("${!1}")
+  if [[ $LAN_RANGE != - ]] && ! in_cidr "${!1}" "$LAN_RANGE"; then
+    warn "${!1} is outside $LAN_NETWORK's automatic range ($LAN_RANGE)."
+    warn "Make sure nothing else on the LAN (e.g. the router's DHCP pool) hands it out."
+  fi
+}
+
 # ── .env handling ────────────────────────────────────────────────────────────
 load_existing_env() {
   local line key value
@@ -330,6 +434,8 @@ write_env() {
   # Optional overlays are enabled through COMPOSE_FILE. Setting it stops
   # Compose from auto-loading docker-compose.override.yml, so keep that last.
   local compose_files="docker-compose.yml" compose_block=''
+  [[ $NETWORK_MODE == lan ]] && compose_files+=":compose/lan-network.yml"
+  [[ -n $BACKEND_LAN_IP ]] && compose_files+=":compose/lan-backend.yml"
   [[ $SPOOLSYNC_DB_MODE == external ]] && compose_files+=":compose/external-db.yml"
   [[ $POSTGRES_PUBLISH == y ]] && compose_files+=":compose/publish-db.yml"
   if [[ $compose_files != docker-compose.yml ]]; then
@@ -357,6 +463,11 @@ PUBLIC_URL=$(q "$PUBLIC_URL")
 ESP32_SERVER_HOST=$(q "$ESP32_SERVER_HOST")
 
 # ── Network ──
+# host = publish ports on this host; lan = own addresses on LAN_NETWORK
+SPOOLSYNC_NETWORK_MODE=$(q "$NETWORK_MODE")
+LAN_NETWORK=$(q "$LAN_NETWORK")
+FRONTEND_LAN_IP=$(q "$FRONTEND_LAN_IP")
+BACKEND_LAN_IP=$(q "$BACKEND_LAN_IP")
 FRONTEND_BIND=$(q "$FRONTEND_BIND")
 FRONTEND_PORT=$(q "$FRONTEND_PORT")
 BACKEND_BIND=$(q "$BACKEND_BIND")
@@ -424,42 +535,101 @@ section "Hostname & network"
 if [[ ${#HOST_IPS[@]} -gt 0 ]]; then
   hint "This host's addresses: $(host_addresses | awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }')"
 fi
-hint "The name or address people type in their browser to reach SpoolSync."
-ask SPOOLSYNC_HOSTNAME "Hostname or IP for SpoolSync" "$(default_for SPOOLSYNC_HOSTNAME "$(guess_hostname)")" v_host
-
-hint "The web UI is served by nginx, which also proxies the API."
-hint "Bind address: 0.0.0.0 = all interfaces, 127.0.0.1 = only a reverse proxy on"
-hint "this host, or one specific address from the list above."
-ask_bind FRONTEND_BIND "Web UI bind address" "$(default_for FRONTEND_BIND 0.0.0.0)"
-ask_port FRONTEND_PORT "Web UI port" "$(default_for FRONTEND_PORT 80)"
+NETWORK_MODE=host
+LAN_NETWORK="$(default_for LAN_NETWORK '')"
+FRONTEND_LAN_IP=''
+BACKEND_LAN_IP=''
+mapfile -t LAN_NETS < <(lan_networks)
+def_network_mode="$(default_for SPOOLSYNC_NETWORK_MODE host)"
+if [[ ${#LAN_NETS[@]} -gt 0 ]]; then
+  hint "LAN networks on this host: ${LAN_NETS[*]}. Containers on one get their own"
+  hint "LAN IP addresses instead of sharing the host's ports."
+  ask_yn USE_LAN "Give SpoolSync its own LAN IP addresses on one of these networks?" \
+    "$([[ $def_network_mode == lan ]] && echo y || echo n)"
+  [[ $USE_LAN == y ]] && NETWORK_MODE=lan
+elif [[ $def_network_mode == lan ]]; then
+  die "SPOOLSYNC_NETWORK_MODE is 'lan' but this host has no macvlan/ipvlan Docker network"
+fi
 
 hint "ESP32 spool holders report weights straight to the backend API, so it"
 hint "must be reachable on the LAN if you use them. Their firmware expects 3000."
-def_backend_bind="$(default_for BACKEND_BIND 0.0.0.0)"
-ask_yn EXPOSE_BACKEND "Expose the backend API on the network (needed for ESP32 devices)?" \
-  "$([[ $def_backend_bind == 127.0.0.1 ]] && echo n || echo y)"
-if [[ $EXPOSE_BACKEND == y ]]; then
-  [[ $def_backend_bind == 127.0.0.1 ]] && def_backend_bind=0.0.0.0
-  ask_bind BACKEND_BIND "Backend API bind address" "$def_backend_bind"
+
+if [[ $NETWORK_MODE == lan ]]; then
+  version_ge "$COMPOSE_VERSION" 2.24.0 \
+    || die "LAN networking needs Docker Compose 2.24 or newer (found $COMPOSE_VERSION)"
+  ask LAN_NETWORK "Docker network to join" "${LAN_NETWORK:-${LAN_NETS[0]}}" v_lan_network
+  load_lan_network "$LAN_NETWORK"
+  hint "$LAN_NETWORK: subnet $LAN_SUBNET, automatic range ${LAN_RANGE/#-/none}, gateway ${LAN_GATEWAY/#-/none}."
+  hint "Fixed addresses keep bookmarks and ESP32 devices working when containers are"
+  hint "recreated. Suggestions come from the top of the range, away from Docker's"
+  hint "automatic assignments. The database stays on a private network."
+  ask_lan_ip FRONTEND_LAN_IP "LAN IP for the web UI"
+
+  ask_yn EXPOSE_BACKEND "Put the backend API on the LAN too (needed for ESP32 devices)?" \
+    "$([[ "$(default_for BACKEND_BIND 0.0.0.0)" == 127.0.0.1 ]] && echo n || echo y)"
+  if [[ $EXPOSE_BACKEND == y ]]; then
+    ask_lan_ip BACKEND_LAN_IP "LAN IP for the backend API"
+    BACKEND_BIND="$(default_for BACKEND_BIND 0.0.0.0)"
+    BACKEND_PORT="$(default_for BACKEND_PORT 3000)"
+  else
+    BACKEND_BIND=127.0.0.1
+    ask_port BACKEND_PORT "Backend API port (this host only)" "$(default_for BACKEND_PORT 3000)"
+  fi
+  # Host-port settings are unused in LAN mode; keep them for switching back.
+  FRONTEND_BIND="$(default_for FRONTEND_BIND 0.0.0.0)"
+  FRONTEND_PORT="$(default_for FRONTEND_PORT 80)"
+
+  hint "The name or address people type in their browser. If you use a hostname,"
+  hint "point its DNS record at $FRONTEND_LAN_IP."
+  ask SPOOLSYNC_HOSTNAME "Hostname or IP for SpoolSync" "$(default_for SPOOLSYNC_HOSTNAME "$FRONTEND_LAN_IP")" v_host
+
+  # A macvlan parent can't talk to its own children without a shim interface.
+  if [[ $LAN_PARENT != - ]] && command -v ip >/dev/null 2>&1 \
+     && ip route get "$FRONTEND_LAN_IP" 2>/dev/null | grep -qw "dev $LAN_PARENT"; then
+    warn "This host routes $FRONTEND_LAN_IP via $LAN_PARENT, so it cannot reach SpoolSync itself"
+    warn "(other LAN devices can). Add a macvlan shim interface if the host needs access."
+  fi
 else
-  BACKEND_BIND=127.0.0.1
+  hint "The name or address people type in their browser to reach SpoolSync."
+  ask SPOOLSYNC_HOSTNAME "Hostname or IP for SpoolSync" "$(default_for SPOOLSYNC_HOSTNAME "$(guess_hostname)")" v_host
+
+  hint "The web UI is served by nginx, which also proxies the API."
+  hint "Bind address: 0.0.0.0 = all interfaces, 127.0.0.1 = only a reverse proxy on"
+  hint "this host, or one specific address from the list above."
+  ask_bind FRONTEND_BIND "Web UI bind address" "$(default_for FRONTEND_BIND 0.0.0.0)"
+  ask_port FRONTEND_PORT "Web UI port" "$(default_for FRONTEND_PORT 80)"
+
+  def_backend_bind="$(default_for BACKEND_BIND 0.0.0.0)"
+  ask_yn EXPOSE_BACKEND "Expose the backend API on the network (needed for ESP32 devices)?" \
+    "$([[ $def_backend_bind == 127.0.0.1 ]] && echo n || echo y)"
+  if [[ $EXPOSE_BACKEND == y ]]; then
+    [[ $def_backend_bind == 127.0.0.1 ]] && def_backend_bind=0.0.0.0
+    ask_bind BACKEND_BIND "Backend API bind address" "$def_backend_bind"
+  else
+    BACKEND_BIND=127.0.0.1
+  fi
+  ask_port BACKEND_PORT "Backend API port" "$(default_for BACKEND_PORT 3000)"
+  [[ $EXPOSE_BACKEND == y && $BACKEND_PORT != 3000 ]] && warn "ESP32 devices may not find the API on a port other than 3000."
 fi
-ask_port BACKEND_PORT "Backend API port" "$(default_for BACKEND_PORT 3000)"
+
+# Where the API listens for ESP32 devices; empty when that's all interfaces.
+api_ip="$BACKEND_LAN_IP"
+[[ -z $api_ip && $BACKEND_BIND != 0.0.0.0 ]] && api_ip="$BACKEND_BIND"
+API_PORT="$([[ -n $BACKEND_LAN_IP ]] && echo 3000 || echo "$BACKEND_PORT")"
 
 ESP32_SERVER_HOST=''
 if [[ $EXPOSE_BACKEND == y ]]; then
-  [[ $BACKEND_PORT != 3000 ]] && warn "ESP32 devices may not find the API on a port other than 3000."
   hint "ESP32 devices are given this host when provisioned. They often cannot resolve"
   hint "local hostnames, so an IP address is the safest choice."
   def_esp32="$(default_for ESP32_SERVER_HOST '')"
   if [[ -z $def_esp32 ]]; then
-    if [[ $BACKEND_BIND != 0.0.0.0 ]]; then def_esp32="$BACKEND_BIND"
+    if [[ -n $api_ip ]]; then def_esp32="$api_ip"
     elif [[ ${#HOST_IPS[@]} -gt 0 ]]; then def_esp32="${HOST_IPS[0]}"
     else def_esp32="$SPOOLSYNC_HOSTNAME"; fi
   fi
   ask ESP32_SERVER_HOST "Host or IP ESP32 devices connect to" "$def_esp32" v_host
-  if [[ $BACKEND_BIND != 0.0.0.0 && $ESP32_SERVER_HOST =~ ^[0-9.]+$ && $ESP32_SERVER_HOST != "$BACKEND_BIND" ]]; then
-    warn "The API only listens on $BACKEND_BIND, so devices connecting to $ESP32_SERVER_HOST will fail."
+  if [[ -n $api_ip && $ESP32_SERVER_HOST =~ ^[0-9.]+$ && $ESP32_SERVER_HOST != "$api_ip" ]]; then
+    warn "The API only listens on $api_ip, so devices connecting to $ESP32_SERVER_HOST will fail."
   fi
 fi
 
@@ -571,8 +741,9 @@ section "Summary"
 cat <<EOF
   Hostname            ${SPOOLSYNC_HOSTNAME}
   Public URL          ${PUBLIC_URL:-auto}
-  Web UI              ${FRONTEND_BIND}:${FRONTEND_PORT}
-  Backend API         ${BACKEND_BIND}:${BACKEND_PORT}
+  Network mode        $([[ $NETWORK_MODE == lan ]] && echo "own LAN addresses on '${LAN_NETWORK}'" || echo "ports on this host")
+  Web UI              $([[ $NETWORK_MODE == lan ]] && echo "${FRONTEND_LAN_IP}:80" || echo "${FRONTEND_BIND}:${FRONTEND_PORT}")
+  Backend API         $([[ -n $BACKEND_LAN_IP ]] && echo "${BACKEND_LAN_IP}:3000" || echo "${BACKEND_BIND}:${BACKEND_PORT}")
   ESP32 server host   ${ESP32_SERVER_HOST:-n/a (API not exposed)}
   Database            $([[ $SPOOLSYNC_DB_MODE == external ]] && echo "external ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}" || echo "bundled (${POSTGRES_USER}/${POSTGRES_DB})")
   Database published  $([[ $POSTGRES_PUBLISH == y ]] && echo "${POSTGRES_PUBLISH_BIND}:${POSTGRES_PUBLISH_PORT}" || echo no)
@@ -635,7 +806,10 @@ fi
 port_suffix="$([[ $FRONTEND_PORT == 80 ]] || echo ":$FRONTEND_PORT")"
 section "SpoolSync is running"
 [[ -n $PUBLIC_URL ]] && echo "  ${PUBLIC_URL}"
-if [[ $FRONTEND_BIND == 127.* ]]; then
+if [[ $NETWORK_MODE == lan ]]; then
+  [[ $SPOOLSYNC_HOSTNAME != "$FRONTEND_LAN_IP" ]] && echo "  http://${SPOOLSYNC_HOSTNAME}"
+  echo "  http://${FRONTEND_LAN_IP}"
+elif [[ $FRONTEND_BIND == 127.* ]]; then
   echo "  http://${FRONTEND_BIND}${port_suffix}  (local only; point your reverse proxy here)"
 elif [[ $FRONTEND_BIND != 0.0.0.0 ]]; then
   echo "  http://${SPOOLSYNC_HOSTNAME}${port_suffix}"
@@ -646,7 +820,7 @@ else
     [[ $ip != "$SPOOLSYNC_HOSTNAME" ]] && echo "  http://${ip}${port_suffix}"
   done
 fi
-[[ -n $ESP32_SERVER_HOST ]] && echo "  ESP32 provisioning will default to host ${ESP32_SERVER_HOST} (API port ${BACKEND_PORT})"
+[[ -n $ESP32_SERVER_HOST ]] && echo "  ESP32 provisioning will default to host ${ESP32_SERVER_HOST} (API port ${API_PORT})"
 [[ $POSTGRES_PUBLISH == y ]] && echo "  Database: ${POSTGRES_PUBLISH_BIND}:${POSTGRES_PUBLISH_PORT} (user ${POSTGRES_USER}, db ${POSTGRES_DB})"
 if [[ $CREATE_ADMIN == y ]]; then
   echo

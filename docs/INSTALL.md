@@ -50,7 +50,10 @@ The wizard:
 1. Checks that Docker and Compose are installed and usable by your user.
 2. Asks for:
    - the hostname or IP for SpoolSync, plus bind addresses and ports for the
-     web UI and the API (it lists this host's IPs);
+     web UI and the API (it lists this host's IPs). If the host has a
+     macvlan/ipvlan Docker network, the wizard can instead give the web UI
+     and API their own LAN IPs (see
+     [LAN networking](CONFIGURATION.md#lan-networking-macvlan--ipvlan));
    - the host or IP ESP32 devices should connect to;
    - the database: bundled, or an external PostgreSQL server (host, port,
      name, user), and optionally publishing the bundled one on a host
@@ -140,6 +143,7 @@ If you omit the `SEED_ADMIN_*` variables the account is
 | **API exposure** | ESP32 spool holders post weights straight to the backend on port 3000. If you don't use them, you can bind it to `127.0.0.1`. | `BACKEND_BIND`, `BACKEND_PORT` |
 | **HTTPS** | Phone NFC scanning (Web NFC), ESP32 USB provisioning (Web Serial) and OIDC login only work over HTTPS. Plan a reverse proxy if you want those. | [below](#reverse-proxy--https) |
 | **Hostname / IPs** | The name people use to reach SpoolSync, and which host interfaces each service listens on. On multi-homed hosts, bind to one LAN IP rather than `0.0.0.0`. | `SPOOLSYNC_HOSTNAME`, `*_BIND` |
+| **Host ports or own LAN IPs** | By default SpoolSync publishes ports on the host's IP. On hosts with a macvlan/ipvlan network, the web UI and API can get their own fixed LAN addresses instead. | `SPOOLSYNC_NETWORK_MODE`, `*_LAN_IP`, [CONFIGURATION.md](CONFIGURATION.md#lan-networking-macvlan--ipvlan) |
 | **ESP32 server host** | Spool holders are given a host to report to when provisioned. By default that's the hostname in your browser's address bar, which devices may not resolve. Set an IP. | `ESP32_SERVER_HOST` |
 | **Database location** | Bundled container (default) or an existing PostgreSQL server. Optionally publish the bundled one for backup tools. | `POSTGRES_HOST` & co., [CONFIGURATION.md](CONFIGURATION.md#database) |
 | **Public URL** | Behind a reverse proxy, fixes the OIDC callback to your public `https://` address. | `PUBLIC_URL` |
@@ -299,4 +303,6 @@ docker compose down -v --rmi all         # also delete the database volumes and 
 | OIDC login loops back to the login page | Must be served over HTTPS (the state cookie is `Secure`). The redirect URI must match exactly. |
 | ESP32 device never reports | It must reach `<host-it-was-provisioned-with>:3000`. Set `ESP32_SERVER_HOST` to the host's LAN IP and re-provision. Check `BACKEND_BIND`/`BACKEND_PORT` and your firewall. |
 | `cannot assign requested address` when starting | A `*_BIND` address isn't assigned to this host. Use `0.0.0.0`, `127.0.0.1` or one of the IPs from `ip -4 addr`. |
+| LAN mode: other devices reach SpoolSync, but the host can't | Normal for macvlan. The host needs a shim interface (a macvlan on the same parent with a route to the containers' range) to talk to its own containers. |
+| LAN mode: `Address already in use` / IP conflict on the LAN | Another device has the address. Pick one inside the network's `--ip-range`, away from the router's DHCP pool, and re-run the wizard. |
 | Backend can't reach an external database | `POSTGRES_HOST` must be reachable from inside the container. `localhost` is the container itself, so use the host's LAN IP. Also check `pg_hba.conf` and `listen_addresses` on the server. |
