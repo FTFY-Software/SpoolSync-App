@@ -404,10 +404,21 @@ ask_lan_ip() { # NAME "Question"
   [[ -n $def ]] || def="$(suggest_lan_ip)"
   ask "$1" "$2" "$def" v_lan_ip
   LAN_CHOSEN+=("${!1}")
-  if [[ $LAN_RANGE != - ]] && ! in_cidr "${!1}" "$LAN_RANGE"; then
-    warn "${!1} is outside $LAN_NETWORK's automatic range ($LAN_RANGE)."
+  warn_outside_range "${!1}"
+}
+
+warn_outside_range() { # ip
+  if [[ $LAN_RANGE != - ]] && ! in_cidr "$1" "$LAN_RANGE"; then
+    warn "$1 is outside $LAN_NETWORK's automatic range ($LAN_RANGE)."
     warn "Make sure nothing else on the LAN (e.g. the router's DHCP pool) hands it out."
   fi
+}
+
+# The API may share the web UI's address (served through its nginx) or take
+# a free address of its own.
+v_backend_lan_ip() {
+  [[ $1 == "$FRONTEND_LAN_IP" ]] && return 0
+  v_lan_ip "$1"
 }
 
 # ── .env handling ────────────────────────────────────────────────────────────
@@ -436,6 +447,7 @@ write_env() {
   local compose_files="docker-compose.yml" compose_block=''
   [[ $NETWORK_MODE == lan ]] && compose_files+=":compose/lan-network.yml"
   [[ -n $BACKEND_LAN_IP ]] && compose_files+=":compose/lan-backend.yml"
+  [[ $API_SHARED == y ]] && compose_files+=":compose/lan-api-shared.yml"
   [[ $SPOOLSYNC_DB_MODE == external ]] && compose_files+=":compose/external-db.yml"
   [[ $POSTGRES_PUBLISH == y ]] && compose_files+=":compose/publish-db.yml"
   if [[ $compose_files != docker-compose.yml ]]; then
@@ -539,6 +551,7 @@ NETWORK_MODE=host
 LAN_NETWORK="$(default_for LAN_NETWORK '')"
 FRONTEND_LAN_IP=''
 BACKEND_LAN_IP=''
+API_SHARED=n
 mapfile -t LAN_NETS < <(lan_networks)
 def_network_mode="$(default_for SPOOLSYNC_NETWORK_MODE host)"
 if [[ ${#LAN_NETS[@]} -gt 0 ]]; then
@@ -565,10 +578,23 @@ if [[ $NETWORK_MODE == lan ]]; then
   hint "automatic assignments. The database stays on a private network."
   ask_lan_ip FRONTEND_LAN_IP "LAN IP for the web UI"
 
-  ask_yn EXPOSE_BACKEND "Put the backend API on the LAN too (needed for ESP32 devices)?" \
+  ask_yn EXPOSE_BACKEND "Make the backend API reachable on the LAN (needed for ESP32 devices)?" \
     "$([[ "$(default_for BACKEND_BIND 0.0.0.0)" == 127.0.0.1 ]] && echo n || echo y)"
   if [[ $EXPOSE_BACKEND == y ]]; then
-    ask_lan_ip BACKEND_LAN_IP "LAN IP for the backend API"
+    hint "Keep the web UI's address ($FRONTEND_LAN_IP) to serve the API from it on port 3000"
+    hint "(one IP for everything), or enter another free IP to give the backend its own."
+    def_api_ip="$(default_for BACKEND_LAN_IP '')"
+    if [[ -z $def_api_ip ]] || ! v_backend_lan_ip "$def_api_ip" >/dev/null; then
+      def_api_ip="$FRONTEND_LAN_IP"
+    fi
+    ask API_LAN_IP "LAN IP for the backend API" "$def_api_ip" v_backend_lan_ip
+    if [[ $API_LAN_IP == "$FRONTEND_LAN_IP" ]]; then
+      API_SHARED=y # served by the frontend's nginx; backend stays private
+    else
+      BACKEND_LAN_IP="$API_LAN_IP"
+      LAN_CHOSEN+=("$BACKEND_LAN_IP")
+      warn_outside_range "$BACKEND_LAN_IP"
+    fi
     BACKEND_BIND="$(default_for BACKEND_BIND 0.0.0.0)"
     BACKEND_PORT="$(default_for BACKEND_PORT 3000)"
   else
@@ -614,14 +640,19 @@ fi
 
 # Where the API listens for ESP32 devices; empty when that's all interfaces.
 api_ip="$BACKEND_LAN_IP"
+[[ $API_SHARED == y ]] && api_ip="$FRONTEND_LAN_IP"
 [[ -z $api_ip && $BACKEND_BIND != 0.0.0.0 ]] && api_ip="$BACKEND_BIND"
-API_PORT="$([[ -n $BACKEND_LAN_IP ]] && echo 3000 || echo "$BACKEND_PORT")"
+API_PORT="$([[ -n $BACKEND_LAN_IP || $API_SHARED == y ]] && echo 3000 || echo "$BACKEND_PORT")"
 
 ESP32_SERVER_HOST=''
 if [[ $EXPOSE_BACKEND == y ]]; then
   hint "ESP32 devices are given this host when provisioned. They often cannot resolve"
   hint "local hostnames, so an IP address is the safest choice."
   def_esp32="$(default_for ESP32_SERVER_HOST '')"
+  # A saved IP that no longer matches where the API listens is stale.
+  if [[ -n $api_ip && $def_esp32 =~ ^[0-9.]+$ && $def_esp32 != "$api_ip" ]]; then
+    def_esp32="$api_ip"
+  fi
   if [[ -z $def_esp32 ]]; then
     if [[ -n $api_ip ]]; then def_esp32="$api_ip"
     elif [[ ${#HOST_IPS[@]} -gt 0 ]]; then def_esp32="${HOST_IPS[0]}"
@@ -743,7 +774,7 @@ cat <<EOF
   Public URL          ${PUBLIC_URL:-auto}
   Network mode        $([[ $NETWORK_MODE == lan ]] && echo "own LAN addresses on '${LAN_NETWORK}'" || echo "ports on this host")
   Web UI              $([[ $NETWORK_MODE == lan ]] && echo "${FRONTEND_LAN_IP}:80" || echo "${FRONTEND_BIND}:${FRONTEND_PORT}")
-  Backend API         $([[ -n $BACKEND_LAN_IP ]] && echo "${BACKEND_LAN_IP}:3000" || echo "${BACKEND_BIND}:${BACKEND_PORT}")
+  Backend API         $(if [[ $API_SHARED == y ]]; then echo "${FRONTEND_LAN_IP}:3000 (shared with the web UI)"; elif [[ -n $BACKEND_LAN_IP ]]; then echo "${BACKEND_LAN_IP}:3000"; else echo "${BACKEND_BIND}:${BACKEND_PORT}"; fi)
   ESP32 server host   ${ESP32_SERVER_HOST:-n/a (API not exposed)}
   Database            $([[ $SPOOLSYNC_DB_MODE == external ]] && echo "external ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}" || echo "bundled (${POSTGRES_USER}/${POSTGRES_DB})")
   Database published  $([[ $POSTGRES_PUBLISH == y ]] && echo "${POSTGRES_PUBLISH_BIND}:${POSTGRES_PUBLISH_PORT}" || echo no)

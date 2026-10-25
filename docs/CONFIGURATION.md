@@ -59,10 +59,29 @@ ports:
 | `SPOOLSYNC_NETWORK_MODE` | `host` | `host` publishes ports on the host (above). `lan` gives the web UI (and optionally the API) its own LAN address. Used by `install.sh`; Compose itself follows `COMPOSE_FILE`. |
 | `LAN_NETWORK` | `lan` | Name of the existing macvlan/ipvlan Docker network to join. It must already exist; SpoolSync does not create it. |
 | `FRONTEND_LAN_IP` | — | Fixed LAN address of the web UI, which listens on port **80** there. |
-| `BACKEND_LAN_IP` | — | Fixed LAN address of the backend API, which listens on port **3000** there. Set `ESP32_SERVER_HOST` to the same IP. |
+| `BACKEND_LAN_IP` | *(empty)* | Only for the two-address layout: a separate fixed LAN address for the backend API (port **3000**). Leave it empty in the one-address layout. |
 
-Enable it with the overlays (`lan-backend.yml` is optional and needs
-`lan-network.yml` before it; Compose 2.24+):
+SpoolSync runs as three containers (web UI, backend, database), and on a
+macvlan/ipvlan network every container needs its own address. You can lay
+that out two ways:
+
+**One LAN address (recommended).** Only the web UI container joins the LAN.
+Its nginx serves the UI on port 80 and, through `lan-api-shared.yml`, also
+listens on port **3000**, forwarding to the backend over the private network.
+ESP32 devices and browsers use the same IP; the backend and database stay
+private.
+
+```sh
+SPOOLSYNC_NETWORK_MODE='lan'
+LAN_NETWORK='lan'
+FRONTEND_LAN_IP='10.71.76.254'
+ESP32_SERVER_HOST='10.71.76.254'
+COMPOSE_FILE='docker-compose.yml:compose/lan-network.yml:compose/lan-api-shared.yml'
+COMPOSE_PATH_SEPARATOR=':'
+```
+
+**Two LAN addresses.** The backend joins the LAN too, with its own address,
+through `lan-backend.yml`:
 
 ```sh
 SPOOLSYNC_NETWORK_MODE='lan'
@@ -74,14 +93,21 @@ COMPOSE_FILE='docker-compose.yml:compose/lan-network.yml:compose/lan-backend.yml
 COMPOSE_PATH_SEPARATOR=':'
 ```
 
+If the API doesn't need to be on the LAN at all (no ESP32 devices), use only
+`lan-network.yml`. Both API overlays load after `lan-network.yml` and need
+Compose 2.24+. In the wizard, enter the web UI's IP for the API to get the
+one-address layout (the default), or a different free IP for two addresses.
+
 How it works:
 
-- The web UI and API join the LAN network **and** keep the private project
-  network, which they use to reach each other and the database. Postgres is
-  never put on the LAN.
+- Containers on the LAN network **also** keep the private project network,
+  which they use to reach each other and the database. Postgres is never put
+  on the LAN.
 - Their `ports:` mappings are removed, and the `*_BIND`/`*_PORT` settings are
-  ignored for services on the LAN. If the API isn't on the LAN, it stays
-  published on the host as configured (the wizard binds it to `127.0.0.1`).
+  ignored for services on the LAN. In the one-address layout the backend
+  publishes no host ports either. If the API isn't on the LAN at all, it
+  stays published on the host as configured (the wizard binds it to
+  `127.0.0.1`).
 - Addresses are **fixed**, so bookmarks and ESP32 devices keep working when
   containers are recreated. Pick them inside the network's subnet, and
   preferably inside its `--ip-range`, so nothing else on the LAN (like the
