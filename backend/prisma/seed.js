@@ -4,6 +4,11 @@ import { ALL_PERMISSIONS, PERMISSION_GROUPS } from '../src/utils/permissions.js'
 
 const prisma = new PrismaClient();
 
+// Initial admin account; override via env (install.sh sets these).
+const ADMIN_USERNAME = process.env.SEED_ADMIN_USERNAME || 'admin';
+const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL || 'admin@spoolsync.local';
+const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD || 'admin123';
+
 const VIEW_PERMISSIONS = PERMISSION_GROUPS.flatMap((g) => g.permissions.filter((p) => p.endsWith(':view')));
 const EDITOR_EXCLUDED = ['users:', 'roles:', 'settings:'];
 const EDITOR_PERMISSIONS = ALL_PERMISSIONS.filter(
@@ -46,14 +51,14 @@ async function main() {
   console.log('Seeded 3 default roles: Administrator, Editor, Viewer');
 
   // ── Seed admin user ────────────────────────────────────────────────────────
-  const passwordHash = await bcrypt.hash('admin123', 10);
+  const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
 
   const admin = await prisma.user.upsert({
-    where: { email: 'admin@spoolsync.local' },
+    where: { email: ADMIN_EMAIL },
     update: { isSuperAdmin: true },
     create: {
-      username: 'admin',
-      email: 'admin@spoolsync.local',
+      username: ADMIN_USERNAME,
+      email: ADMIN_EMAIL,
       passwordHash,
       isSuperAdmin: true,
       customRoles: { connect: [{ id: adminRole.id }] },

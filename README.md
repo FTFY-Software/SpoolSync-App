@@ -85,23 +85,27 @@
 
 ## Getting Started
 
-1. **Pull the latest images and start:**
+You need a host with Docker and the Compose plugin, and a user that can run `docker` without `sudo`.
 
-   ```sh
-   docker compose up -d
-   ```
+```sh
+git clone https://github.com/Spool-Sync/SpoolSync-App.git
+cd SpoolSync-App
+./install.sh
+```
 
-2. **Or build from source:**
+The wizard asks for ports, secrets and the admin account. Press Enter on a secret to have a strong random value generated. It then writes `.env`, builds and starts the stack, and creates your admin login. When it finishes, open the URL it prints.
 
-   ```sh
-   git clone https://github.com/Spool-Sync/SpoolSync-App.git
-   cd SpoolSync-App
-   cp .env.example .env   # edit as needed
-   docker compose up --build -d
-   ```
+- **[Installation guide](docs/INSTALL.md)**: manual install, what to decide before the first run, HTTPS/reverse proxy, updating, backups, troubleshooting.
+- **[Configuration reference](docs/CONFIGURATION.md)**: every `.env` setting and what is configured in the UI instead.
 
-3. **Access the web UI:**
-   - Visit `http://localhost` (or your configured port)
+Manual quick start, if you'd rather not use the wizard:
+
+```sh
+cp .env.example .env    # then replace POSTGRES_PASSWORD and JWT_SECRET
+docker compose up -d --build
+docker compose exec -e SEED_ADMIN_EMAIL=you@example.com -e SEED_ADMIN_PASSWORD='change-me' \
+  backend node prisma/seed.js   # creates roles + the first admin account
+```
 
 ---
 

@@ -28,4 +28,7 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma migrate deploy && node src/index.js"]
+# prisma/migrations/ is not committed to the repo, so `migrate deploy` alone
+# would leave a fresh database without tables. Fall back to `db push`, which
+# syncs the schema directly (and refuses destructive changes).
+CMD ["sh", "-c", "if ls prisma/migrations/*/migration.sql >/dev/null 2>&1; then npx prisma migrate deploy; else npx prisma db push --skip-generate; fi && node src/index.js"]
