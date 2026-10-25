@@ -48,10 +48,17 @@ cd SpoolSync-App
 The wizard:
 
 1. Checks that Docker and Compose are installed and usable by your user.
-2. Asks for ports, secrets, session lifetime and the admin account. **Press
-   Enter on any secret to have a strong random value generated.**
-3. Optionally asks for advanced settings (printer polling, syslog,
-   Browserless, reverse-proxy binding, prebuilt images).
+2. Asks for:
+   - the hostname or IP for SpoolSync, plus bind addresses and ports for the
+     web UI and the API (it lists this host's IPs);
+   - the host or IP ESP32 devices should connect to;
+   - the database: bundled, or an external PostgreSQL server (host, port,
+     name, user), and optionally publishing the bundled one on a host
+     IP/port;
+   - secrets, session lifetime and the admin account. **Press Enter on any
+     secret to have a strong random value generated.**
+3. Optionally asks for advanced settings (public URL for a reverse proxy,
+   printer polling, syslog, Browserless, prebuilt images).
 4. Shows a summary, writes `.env` (mode `600`), builds and starts the stack,
    waits for the backend to be healthy and creates the admin account.
 5. Prints the URL and, if it was generated, the admin password (**shown
@@ -132,7 +139,10 @@ If you omit the `SEED_ADMIN_*` variables the account is
 | **Web UI port** | Port 80 may already be taken (another web server, reverse proxy). | `FRONTEND_PORT` |
 | **API exposure** | ESP32 spool holders post weights straight to the backend on port 3000. If you don't use them, you can bind it to `127.0.0.1`. | `BACKEND_BIND`, `BACKEND_PORT` |
 | **HTTPS** | Phone NFC scanning (Web NFC), ESP32 USB provisioning (Web Serial) and OIDC login only work over HTTPS. Plan a reverse proxy if you want those. | [below](#reverse-proxy--https) |
-| **Hostname** | ESP32 devices are provisioned with the hostname shown in your browser's address bar. Open the UI by a name or IP the devices can resolve, not `localhost`. | — |
+| **Hostname / IPs** | The name people use to reach SpoolSync, and which host interfaces each service listens on. On multi-homed hosts, bind to one LAN IP rather than `0.0.0.0`. | `SPOOLSYNC_HOSTNAME`, `*_BIND` |
+| **ESP32 server host** | Spool holders are given a host to report to when provisioned. By default that's the hostname in your browser's address bar, which devices may not resolve. Set an IP. | `ESP32_SERVER_HOST` |
+| **Database location** | Bundled container (default) or an existing PostgreSQL server. Optionally publish the bundled one for backup tools. | `POSTGRES_HOST` & co., [CONFIGURATION.md](CONFIGURATION.md#database) |
+| **Public URL** | Behind a reverse proxy, fixes the OIDC callback to your public `https://` address. | `PUBLIC_URL` |
 | **Session lifetime** | Default 7 days. | `JWT_EXPIRES_IN` |
 | **Printer polling** | Default every 30 s. | `PRINTER_POLL_INTERVAL_MS` |
 
@@ -179,7 +189,10 @@ in front of the **frontend** container. It already proxies `/api` and
 2. Proxy your hostname to `http://127.0.0.1:8080`. The proxy must:
    - support WebSockets (`Upgrade`/`Connection` headers) for `/socket.io/`;
    - pass `Host` (or `X-Forwarded-Host`) and `X-Forwarded-Proto: https`. The
-     backend builds the OIDC callback URL from these.
+     backend builds the OIDC callback URL from these, unless you set
+     `PUBLIC_URL='https://spoolsync.example.com'` in `.env` (wizard:
+     Advanced → Public URL). That's the simplest fix if your proxy rewrites
+     headers.
 
    Caddy example:
 
@@ -213,8 +226,11 @@ in front of the **frontend** container. It already proxies `/api` and
    `https://<your-host>/api/v1/auth/oidc/callback` with your identity
    provider, then enter the issuer, client ID and secret under **Settings**.
 
-Keep `BACKEND_BIND='0.0.0.0'` if ESP32 devices need to reach port 3000 on the
-LAN. They talk to the backend directly, not through the proxy.
+Keep `BACKEND_BIND='0.0.0.0'` (or a LAN IP) if ESP32 devices need to reach
+port 3000. They talk to the backend directly, not through the proxy, so set
+`ESP32_SERVER_HOST` to the host's LAN IP. A proxy hostname like
+`spoolsync.example.com` may resolve to a different machine, or not resolve at
+all, on the devices' network.
 
 ---
 
@@ -281,4 +297,6 @@ docker compose down -v --rmi all         # also delete the database volumes and 
 | `Bind for 0.0.0.0:80 failed: port is already allocated` | Change `FRONTEND_PORT` (or `BACKEND_PORT`) in `.env`. |
 | NFC button / USB provisioning missing | They need HTTPS and a supporting browser (Chrome on Android for NFC; desktop Chrome or Edge for Web Serial). |
 | OIDC login loops back to the login page | Must be served over HTTPS (the state cookie is `Secure`). The redirect URI must match exactly. |
-| ESP32 device never reports | It must reach `<hostname-you-provisioned-with>:3000`. Check `BACKEND_BIND`/`BACKEND_PORT` and your firewall. |
+| ESP32 device never reports | It must reach `<host-it-was-provisioned-with>:3000`. Set `ESP32_SERVER_HOST` to the host's LAN IP and re-provision. Check `BACKEND_BIND`/`BACKEND_PORT` and your firewall. |
+| `cannot assign requested address` when starting | A `*_BIND` address isn't assigned to this host. Use `0.0.0.0`, `127.0.0.1` or one of the IPs from `ip -4 addr`. |
+| Backend can't reach an external database | `POSTGRES_HOST` must be reachable from inside the container. `localhost` is the container itself, so use the host's LAN IP. Also check `pg_hba.conf` and `listen_addresses` on the server. |

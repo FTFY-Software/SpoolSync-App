@@ -23,18 +23,63 @@ Values in `.env` are single-quoted (`KEY='value'`) so Compose does not expand
 
 The wizard generates both randomly unless you type your own.
 
-### Network
+### Hostnames & addresses
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `SPOOLSYNC_HOSTNAME` | *(empty)* | Name or IP people use to reach SpoolSync. The wizard uses it for its output and as the default for the settings below. The app itself doesn't read it. |
+| `PUBLIC_URL` | *(empty)* | Public base URL, e.g. `https://spoolsync.example.com`. When set, the backend builds the OIDC callback (`<PUBLIC_URL>/api/v1/auth/oidc/callback`) from it instead of from the request's `Host`/`X-Forwarded-*` headers. Set it when a reverse proxy doesn't forward those headers correctly. |
+| `ESP32_SERVER_HOST` | *(empty)* | Default host/IP that the ESP32 provisioning dialog sends to spool holders. It is served at `GET /api/client-config` and can still be edited in the dialog. Empty means the hostname in the browser's address bar, which devices may not be able to resolve (mDNS names, a proxy hostname). An IP address is safest. |
+
+### Network
+
+Bind addresses must be `0.0.0.0` (all interfaces), a loopback address, or an
+IPv4 address assigned to the host. Docker refuses to publish on anything else.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FRONTEND_BIND` | `0.0.0.0` | Host interface for the web UI. Set to `127.0.0.1` when a reverse proxy on the same host serves it, or to one LAN IP on a multi-homed host. |
 | `FRONTEND_PORT` | `80` | Host port of the web UI (nginx; it proxies `/api` and `/socket.io` to the backend). |
-| `FRONTEND_BIND` | `0.0.0.0` | Host interface for the web UI. Set to `127.0.0.1` when a reverse proxy on the same host serves it. |
+| `BACKEND_BIND` | `0.0.0.0` | Host interface for the API. `127.0.0.1` hides it from the network; the UI still works through nginx, but ESP32 devices can't connect. If you bind a specific IP, set `ESP32_SERVER_HOST` to that IP. |
 | `BACKEND_PORT` | `3000` | Host port of the backend API. ESP32 spool holders connect here directly. Keep `3000` unless your firmware is set up for another port. |
-| `BACKEND_BIND` | `0.0.0.0` | Host interface for the API. `127.0.0.1` hides it from the network; the UI still works through nginx, but ESP32 devices can't connect. |
 
 Inside the Compose network the backend always listens on `3000`, and nginx
 always reaches it at `backend:3000`. These settings only change the
 published host ports.
+
+### Database
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `POSTGRES_HOST` | `postgres` | Database host the backend connects to. `postgres` is the bundled container. For an external server, use its hostname or LAN IP: inside the container, `localhost` means the container itself. |
+| `POSTGRES_PORT` | `5432` | Database port the backend connects to. |
+| `POSTGRES_DB` | `spoolsync` | Database name. The bundled container creates it only when its volume is first initialised. |
+| `POSTGRES_USER` | `spoolsync` | Database user. The bundled container creates it only when its volume is first initialised. |
+| `POSTGRES_PUBLISH_BIND` | `127.0.0.1` | Host interface for the bundled database, when `compose/publish-db.yml` is enabled. |
+| `POSTGRES_PUBLISH_PORT` | `5432` | Host port for the bundled database, when `compose/publish-db.yml` is enabled. |
+| `SPOOLSYNC_DB_MODE`, `POSTGRES_PUBLISH` | `bundled`, `n` | Used only by `install.sh` to remember your choices. |
+
+**External database.** Point `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DB`/
+`POSTGRES_USER`/`POSTGRES_PASSWORD` at an existing server (the database
+and user must already exist). Then enable the overlay that removes the
+bundled container (needs Compose 2.24+):
+
+```sh
+COMPOSE_FILE='docker-compose.yml:compose/external-db.yml'
+COMPOSE_PATH_SEPARATOR=':'
+```
+
+**Publishing the bundled database** for backup or admin tools:
+
+```sh
+COMPOSE_FILE='docker-compose.yml:compose/publish-db.yml'
+COMPOSE_PATH_SEPARATOR=':'
+```
+
+The wizard sets these for you. After an existing install switches to an
+external database, Compose stops managing the old bundled container; remove
+it with `docker rm -f <project>-postgres-1`. Its data volume is kept until
+you delete it.
 
 ### Sessions
 
@@ -62,26 +107,24 @@ published host ports.
 | Variable | Description |
 | --- | --- |
 | `COMPOSE_PROJECT_NAME` | Prefix for container, network and volume names. The default is the directory name (e.g. `spoolsync-app`). Changing it on an existing install points Compose at **new, empty** volumes. |
+| `COMPOSE_FILE` | Colon-separated list of Compose files (see [Database](#database)). Once set, Compose no longer loads `docker-compose.override.yml` automatically, so add it at the end of the list. The wizard does this when the file exists. |
 
-For anything else, such as an external Postgres, extra networks or resource
-limits, create a `docker-compose.override.yml`. Compose merges it
-automatically, and git ignores it. Example for an external database:
+For anything else, such as extra networks or resource limits, create a
+`docker-compose.override.yml`. Compose merges it automatically, and git
+ignores it. Passwords with characters outside `A-Z a-z 0-9 . _ ~ -` can be
+used by overriding the whole `DATABASE_URL` there, percent-encoded:
 
 ```yaml
 services:
   backend:
     environment:
-      DATABASE_URL: postgresql://user:pass@db.example.com:5432/spoolsync?schema=public
-    depends_on: !reset {}
-  postgres:
-    profiles: ["disabled"]
+      DATABASE_URL: postgresql://user:p%40ss@db.example.com:5432/spoolsync?schema=public
 ```
 
 ## Fixed settings (in the images)
 
 | Setting | Value | Where to change |
 | --- | --- | --- |
-| Database name / user | `spoolsync` / `spoolsync` | `docker-compose.yml` (only before first run) |
 | `NODE_ENV` | `production` | `docker-compose.yml`. Production marks cookies `Secure` and hides stack traces. |
 | nginx upstream | `BACKEND_HOST=backend` | Environment of the `frontend` container (useful in Kubernetes) |
 | Filament database | `api.openfilamentdatabase.org` | Built in. Needs outbound HTTPS from the backend. |

@@ -3,13 +3,13 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: spoolsync
-      POSTGRES_USER: spoolsync
+      POSTGRES_DB: ${POSTGRES_DB:-spoolsync}
+      POSTGRES_USER: ${POSTGRES_USER:-spoolsync}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spoolsync_dev}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spoolsync"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -24,7 +24,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://spoolsync:${POSTGRES_PASSWORD:-spoolsync_dev}@postgres:5432/spoolsync?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-spoolsync}:${POSTGRES_PASSWORD:-spoolsync_dev}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-spoolsync}?schema=public
       PORT: 3000
       NODE_ENV: production
       JWT_SECRET: ${JWT_SECRET:-change_this_in_production}
@@ -32,6 +32,8 @@ services:
       PRINTER_POLL_INTERVAL_MS: ${PRINTER_POLL_INTERVAL_MS:-30000}
       SYSLOG_HOST: ${SYSLOG_HOST:-}
       BROWSERLESS_URL: ${BROWSERLESS_URL:-}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      ESP32_SERVER_HOST: ${ESP32_SERVER_HOST:-}
     volumes:
       - integrations_data:/app/integrations/printers
     ports:

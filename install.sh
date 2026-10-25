@@ -50,12 +50,17 @@ Options:
   -h, --help      Show this help.
 
 Presettable variables:
-  FRONTEND_PORT FRONTEND_BIND BACKEND_PORT BACKEND_BIND POSTGRES_PASSWORD
+  SPOOLSYNC_HOSTNAME FRONTEND_BIND FRONTEND_PORT BACKEND_BIND BACKEND_PORT
+  ESP32_SERVER_HOST PUBLIC_URL
+  SPOOLSYNC_DB_MODE (bundled|external) POSTGRES_HOST POSTGRES_PORT POSTGRES_DB
+  POSTGRES_USER POSTGRES_PASSWORD POSTGRES_PUBLISH (y|n) POSTGRES_PUBLISH_BIND
+  POSTGRES_PUBLISH_PORT
   JWT_SECRET JWT_EXPIRES_IN PRINTER_POLL_INTERVAL_MS SYSLOG_HOST
   BROWSERLESS_URL SPOOLSYNC_IMAGE_SOURCE (build|pull) SPOOLSYNC_TAG
   ADMIN_USERNAME ADMIN_EMAIL ADMIN_PASSWORD CREATE_ADMIN (y|n)
 
-Secrets left empty are generated randomly.
+Secrets left empty are generated randomly (except an external database's
+password). At an optional prompt, enter "-" to clear the current value.
 EOF
 }
 
@@ -92,7 +97,25 @@ v_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )) || { echo "must be a number between 1 and 65535"; return 1; }
 }
 v_bind() {
+  local octet
   [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "must be an IPv4 address such as 0.0.0.0 or 127.0.0.1"; return 1; }
+  for octet in ${1//./ }; do
+    (( 10#$octet <= 255 )) || { echo "each part of an IPv4 address must be 0-255"; return 1; }
+  done
+}
+v_host() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { echo "must be a hostname or IPv4 address"; return 1; }
+}
+v_optional_url() {
+  local re="^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]']*)?$"
+  [[ -z "$1" || "$1" =~ $re ]] || { echo "must be a URL such as https://spoolsync.example.com"; return 1; }
+}
+v_ident() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || { echo "letters, digits and _ only, starting with a letter"; return 1; }
+}
+v_ext_db_password() {
+  [[ -n "$1" ]] || { echo "the external database's password is required"; return 1; }
+  [[ "$1" =~ ^[A-Za-z0-9._~-]+$ ]] || { echo "may only contain A-Z a-z 0-9 . _ ~ - (it is embedded in a URL)"; return 1; }
 }
 v_db_password() {
   [[ "$1" =~ ^[A-Za-z0-9._~-]+$ ]] || { echo "may only contain A-Z a-z 0-9 . _ ~ - (it is embedded in a URL)"; return 1; }
@@ -151,6 +174,7 @@ ask() {
       read -r -p "$question ${DIM}[${def:-none}]${RESET}: " answer || die "Input closed"
       answer="${answer:-$def}"
     fi
+    [[ $answer == - ]] && answer='' # "-" clears an optional value
     if reason="$($validator "$answer")"; then
       printf -v "$name" '%s' "$answer"
       return
@@ -179,7 +203,7 @@ ask_secret() {
         answer="$current"
       else
         answer="$($generator)"
-        GENERATED+=("$name")
+        [[ -n "$answer" ]] && GENERATED+=("$name")
       fi
     elif [[ $ASSUME_YES -eq 0 ]]; then
       read -r -s -p "Repeat to confirm: " confirm || die "Input closed"
@@ -216,6 +240,7 @@ ask_yn() {
 gen_db_password() { random_hex 24; }
 gen_jwt_secret()  { random_hex 48; }
 gen_admin_pass()  { random_password 20; }
+gen_none()        { :; }
 
 # ── Port checks ──────────────────────────────────────────────────────────────
 port_in_use_by_others() { # port
@@ -241,6 +266,46 @@ ask_port() { # NAME "Question" default
   done
 }
 
+# ── Host addresses ───────────────────────────────────────────────────────────
+# "address interface" lines for this host's IPv4 addresses, skipping Docker's
+# own bridge interfaces.
+host_addresses() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth)/ { sub(/\/.*/, "", $4); print $4, $2 }'
+  else
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' | sed 's/$/ -/' || true
+  fi
+}
+
+guess_hostname() {
+  local fqdn
+  fqdn="$(hostname -f 2>/dev/null || hostname)"
+  if [[ $fqdn == *.* || ${#HOST_IPS[@]} -eq 0 ]]; then
+    printf '%s' "$fqdn"
+  else
+    printf '%s' "${HOST_IPS[0]}"
+  fi
+}
+
+# Bind addresses must exist on this host or Docker fails to publish the port.
+ask_bind() { # NAME "Question" default
+  local name="$1" ip
+  while true; do
+    ask "$name" "$2" "$3" v_bind
+    ip="${!name}"
+    if [[ $ip == 0.0.0.0 || $ip == 127.* || " ${HOST_IPS[*]} " == *" $ip "* ]]; then
+      return
+    fi
+    [[ $ASSUME_YES -eq 1 ]] && die "$name: $ip is not an address of this host"
+    warn "$ip is not an address of this host; Docker would fail to publish the port"
+    set -- "$1" "$2" 0.0.0.0
+  done
+}
+
+version_ge() { # a b → a >= b
+  printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
 # ── .env handling ────────────────────────────────────────────────────────────
 load_existing_env() {
   local line key value
@@ -262,6 +327,20 @@ write_env() {
     cp -p "$ENV_FILE" "$backup"
     ok "Previous configuration saved to $backup"
   fi
+  # Optional overlays are enabled through COMPOSE_FILE. Setting it stops
+  # Compose from auto-loading docker-compose.override.yml, so keep that last.
+  local compose_files="docker-compose.yml" compose_block=''
+  [[ $SPOOLSYNC_DB_MODE == external ]] && compose_files+=":compose/external-db.yml"
+  [[ $POSTGRES_PUBLISH == y ]] && compose_files+=":compose/publish-db.yml"
+  if [[ $compose_files != docker-compose.yml ]]; then
+    [[ -f docker-compose.override.yml ]] && compose_files+=":docker-compose.override.yml"
+    compose_block="
+# ── Compose files ──
+COMPOSE_FILE=$(q "$compose_files")
+COMPOSE_PATH_SEPARATOR=':'
+"
+  fi
+
   ( umask 077
     cat > "$ENV_FILE" <<EOF
 # Generated by install.sh on $(date -u '+%Y-%m-%d %H:%M:%S UTC').
@@ -272,12 +351,27 @@ write_env() {
 POSTGRES_PASSWORD=$(q "$POSTGRES_PASSWORD")
 JWT_SECRET=$(q "$JWT_SECRET")
 
-# ── Network ──
-FRONTEND_PORT=$(q "$FRONTEND_PORT")
-FRONTEND_BIND=$(q "$FRONTEND_BIND")
-BACKEND_PORT=$(q "$BACKEND_PORT")
-BACKEND_BIND=$(q "$BACKEND_BIND")
+# ── Hostnames & addresses ──
+SPOOLSYNC_HOSTNAME=$(q "$SPOOLSYNC_HOSTNAME")
+PUBLIC_URL=$(q "$PUBLIC_URL")
+ESP32_SERVER_HOST=$(q "$ESP32_SERVER_HOST")
 
+# ── Network ──
+FRONTEND_BIND=$(q "$FRONTEND_BIND")
+FRONTEND_PORT=$(q "$FRONTEND_PORT")
+BACKEND_BIND=$(q "$BACKEND_BIND")
+BACKEND_PORT=$(q "$BACKEND_PORT")
+
+# ── Database ──
+SPOOLSYNC_DB_MODE=$(q "$SPOOLSYNC_DB_MODE")
+POSTGRES_HOST=$(q "$POSTGRES_HOST")
+POSTGRES_PORT=$(q "$POSTGRES_PORT")
+POSTGRES_DB=$(q "$POSTGRES_DB")
+POSTGRES_USER=$(q "$POSTGRES_USER")
+POSTGRES_PUBLISH=$(q "$POSTGRES_PUBLISH")
+POSTGRES_PUBLISH_BIND=$(q "$POSTGRES_PUBLISH_BIND")
+POSTGRES_PUBLISH_PORT=$(q "$POSTGRES_PUBLISH_PORT")
+${compose_block}
 # ── Sessions ──
 JWT_EXPIRES_IN=$(q "$JWT_EXPIRES_IN")
 
@@ -308,9 +402,11 @@ elif command -v docker-compose >/dev/null 2>&1; then
 else
   die "Docker Compose is not installed (https://docs.docker.com/compose/install/)"
 fi
-ok "Using $("${COMPOSE[@]}" version --short 2>/dev/null | sed 's/^/Compose /' || echo "${COMPOSE[*]}")"
+COMPOSE_VERSION="$("${COMPOSE[@]}" version --short 2>/dev/null | sed 's/^v//' || echo 0)"
+ok "Using Compose $COMPOSE_VERSION"
 
 load_existing_env
+mapfile -t HOST_IPS < <(host_addresses | awk '{print $1}')
 
 # Compose names volumes <project>_postgres_data; the project defaults to the
 # directory name.
@@ -323,44 +419,107 @@ fi
 if [[ -f "$ENV_FILE" ]]; then
   info "Existing $ENV_FILE found; its values are used as defaults."
 fi
-if [[ $DB_VOLUME_EXISTS -eq 1 ]]; then
-  warn "An existing SpoolSync database volume was found for project '$PROJECT'."
-  warn "Its password was fixed when it was created; keep the same POSTGRES_PASSWORD."
-fi
-
 # ── Questions ────────────────────────────────────────────────────────────────
-section "Network"
+section "Hostname & network"
+if [[ ${#HOST_IPS[@]} -gt 0 ]]; then
+  hint "This host's addresses: $(host_addresses | awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }')"
+fi
+hint "The name or address people type in their browser to reach SpoolSync."
+ask SPOOLSYNC_HOSTNAME "Hostname or IP for SpoolSync" "$(default_for SPOOLSYNC_HOSTNAME "$(guess_hostname)")" v_host
+
 hint "The web UI is served by nginx, which also proxies the API."
+hint "Bind address: 0.0.0.0 = all interfaces, 127.0.0.1 = only a reverse proxy on"
+hint "this host, or one specific address from the list above."
+ask_bind FRONTEND_BIND "Web UI bind address" "$(default_for FRONTEND_BIND 0.0.0.0)"
 ask_port FRONTEND_PORT "Web UI port" "$(default_for FRONTEND_PORT 80)"
 
 hint "ESP32 spool holders report weights straight to the backend API, so it"
 hint "must be reachable on the LAN if you use them. Their firmware expects 3000."
-def_expose="$([[ "$(default_for BACKEND_BIND 0.0.0.0)" == 127.0.0.1 ]] && echo n || echo y)"
-ask_yn EXPOSE_BACKEND "Expose the backend API on the network (needed for ESP32 devices)?" "$def_expose"
+def_backend_bind="$(default_for BACKEND_BIND 0.0.0.0)"
+ask_yn EXPOSE_BACKEND "Expose the backend API on the network (needed for ESP32 devices)?" \
+  "$([[ $def_backend_bind == 127.0.0.1 ]] && echo n || echo y)"
 if [[ $EXPOSE_BACKEND == y ]]; then
-  BACKEND_BIND=0.0.0.0
+  [[ $def_backend_bind == 127.0.0.1 ]] && def_backend_bind=0.0.0.0
+  ask_bind BACKEND_BIND "Backend API bind address" "$def_backend_bind"
 else
   BACKEND_BIND=127.0.0.1
 fi
 ask_port BACKEND_PORT "Backend API port" "$(default_for BACKEND_PORT 3000)"
-[[ $EXPOSE_BACKEND == y && $BACKEND_PORT != 3000 ]] && warn "ESP32 devices may not find the API on a port other than 3000."
 
-section "Secrets"
-hint "Leave blank to generate strong random values (recommended)."
-if [[ $DB_VOLUME_EXISTS -eq 1 && -z "$(default_for POSTGRES_PASSWORD '')" ]]; then
-  warn "No saved database password, but a database already exists. Enter its original password,"
-  warn "or remove the old data first: ${COMPOSE[*]} down -v"
+ESP32_SERVER_HOST=''
+if [[ $EXPOSE_BACKEND == y ]]; then
+  [[ $BACKEND_PORT != 3000 ]] && warn "ESP32 devices may not find the API on a port other than 3000."
+  hint "ESP32 devices are given this host when provisioned. They often cannot resolve"
+  hint "local hostnames, so an IP address is the safest choice."
+  def_esp32="$(default_for ESP32_SERVER_HOST '')"
+  if [[ -z $def_esp32 ]]; then
+    if [[ $BACKEND_BIND != 0.0.0.0 ]]; then def_esp32="$BACKEND_BIND"
+    elif [[ ${#HOST_IPS[@]} -gt 0 ]]; then def_esp32="${HOST_IPS[0]}"
+    else def_esp32="$SPOOLSYNC_HOSTNAME"; fi
+  fi
+  ask ESP32_SERVER_HOST "Host or IP ESP32 devices connect to" "$def_esp32" v_host
+  if [[ $BACKEND_BIND != 0.0.0.0 && $ESP32_SERVER_HOST =~ ^[0-9.]+$ && $ESP32_SERVER_HOST != "$BACKEND_BIND" ]]; then
+    warn "The API only listens on $BACKEND_BIND, so devices connecting to $ESP32_SERVER_HOST will fail."
+  fi
 fi
-ask_secret POSTGRES_PASSWORD "Database password" "$(default_for POSTGRES_PASSWORD '')" v_db_password gen_db_password
-if [[ $DB_VOLUME_EXISTS -eq 1 && -n "${EXISTING[POSTGRES_PASSWORD]:-}" && "$POSTGRES_PASSWORD" != "${EXISTING[POSTGRES_PASSWORD]}" ]]; then
-  warn "The existing database still uses the old password; the backend will fail to connect"
-  warn "unless you also change it inside Postgres (see docs/CONFIGURATION.md)."
-  ask_yn CONTINUE "Continue anyway?" n
-  [[ $CONTINUE == y ]] || die "Aborted"
+
+section "Database"
+POSTGRES_PUBLISH_BIND="$(default_for POSTGRES_PUBLISH_BIND 127.0.0.1)"
+POSTGRES_PUBLISH_PORT="$(default_for POSTGRES_PUBLISH_PORT 5432)"
+ask_yn USE_EXTERNAL_DB "Use an external PostgreSQL server instead of the bundled one?" \
+  "$([[ "$(default_for SPOOLSYNC_DB_MODE bundled)" == external ]] && echo y || echo n)"
+if [[ $USE_EXTERNAL_DB == y ]]; then
+  version_ge "$COMPOSE_VERSION" 2.24.0 \
+    || die "An external database needs Docker Compose 2.24 or newer (found $COMPOSE_VERSION)"
+  SPOOLSYNC_DB_MODE=external
+  POSTGRES_PUBLISH=n
+  hint "The server must be reachable from inside the backend container; 'localhost' won't work."
+  def_db_host="$(default_for POSTGRES_HOST '')"
+  [[ $def_db_host == postgres ]] && def_db_host=''
+  ask POSTGRES_HOST "Database host or IP" "$def_db_host" v_host
+  if [[ $POSTGRES_HOST == localhost || $POSTGRES_HOST == 127.* ]]; then
+    warn "$POSTGRES_HOST refers to the backend container itself; use the host's LAN IP instead."
+  fi
+  ask POSTGRES_PORT "Database port" "$(default_for POSTGRES_PORT 5432)" v_port
+  ask POSTGRES_DB "Database name" "$(default_for POSTGRES_DB spoolsync)" v_ident
+  ask POSTGRES_USER "Database user" "$(default_for POSTGRES_USER spoolsync)" v_ident
+  ask_secret POSTGRES_PASSWORD "Database password" "$(default_for POSTGRES_PASSWORD '')" v_ext_db_password gen_none
+else
+  SPOOLSYNC_DB_MODE=bundled
+  POSTGRES_HOST=postgres
+  POSTGRES_PORT=5432
+  POSTGRES_DB="$(default_for POSTGRES_DB spoolsync)"
+  POSTGRES_USER="$(default_for POSTGRES_USER spoolsync)"
+  if [[ $DB_VOLUME_EXISTS -eq 1 ]]; then
+    warn "An existing SpoolSync database volume was found for project '$PROJECT'."
+    warn "Its password was fixed when it was created; keep the same POSTGRES_PASSWORD."
+    if [[ -z "$(default_for POSTGRES_PASSWORD '')" ]]; then
+      warn "No saved database password. Enter its original password,"
+      warn "or remove the old data first: ${COMPOSE[*]} down -v"
+    fi
+  fi
+  hint "Leave blank to generate a strong random password (recommended)."
+  ask_secret POSTGRES_PASSWORD "Database password" "$(default_for POSTGRES_PASSWORD '')" v_db_password gen_db_password
+  if [[ $DB_VOLUME_EXISTS -eq 1 && -n "${EXISTING[POSTGRES_PASSWORD]:-}" && "$POSTGRES_PASSWORD" != "${EXISTING[POSTGRES_PASSWORD]}" ]]; then
+    warn "The existing database still uses the old password; the backend will fail to connect"
+    warn "unless you also change it inside Postgres (see docs/CONFIGURATION.md)."
+    ask_yn CONTINUE "Continue anyway?" n
+    [[ $CONTINUE == y ]] || die "Aborted"
+  fi
+
+  hint "Publishing the database port lets backup or admin tools connect to it."
+  ask_yn POSTGRES_PUBLISH "Publish the database port on this host?" "$(default_for POSTGRES_PUBLISH n)"
+  if [[ $POSTGRES_PUBLISH == y ]]; then
+    hint "127.0.0.1 = this host only (recommended), 0.0.0.0 = the whole network."
+    ask_bind POSTGRES_PUBLISH_BIND "Database bind address" "$POSTGRES_PUBLISH_BIND"
+    ask_port POSTGRES_PUBLISH_PORT "Database host port" "$POSTGRES_PUBLISH_PORT"
+  fi
 fi
+
+section "Login sessions"
+hint "Leave blank to generate a strong random secret (recommended)."
 ask_secret JWT_SECRET "Login session secret (JWT_SECRET)" "$(default_for JWT_SECRET '')" v_jwt_secret gen_jwt_secret
 
-section "Sessions"
 ask JWT_EXPIRES_IN "How long a login stays valid (e.g. 12h, 7d, 30d)" "$(default_for JWT_EXPIRES_IN 7d)" v_duration
 
 section "Admin account"
@@ -376,24 +535,26 @@ fi
 PRINTER_POLL_INTERVAL_MS="$(default_for PRINTER_POLL_INTERVAL_MS 30000)"
 SYSLOG_HOST="$(default_for SYSLOG_HOST '')"
 BROWSERLESS_URL="$(default_for BROWSERLESS_URL '')"
-FRONTEND_BIND="$(default_for FRONTEND_BIND 0.0.0.0)"
+PUBLIC_URL="$(default_for PUBLIC_URL '')"
 SPOOLSYNC_IMAGE_SOURCE="$(default_for SPOOLSYNC_IMAGE_SOURCE build)"
 SPOOLSYNC_TAG="$(default_for SPOOLSYNC_TAG latest)"
 
 section "Advanced"
-ask_yn ADVANCED "Configure advanced options (printer polling, syslog, reverse proxy, images)?" n
+ask_yn ADVANCED "Configure advanced options (public URL, printer polling, syslog, images)?" n
 if [[ $ADVANCED == y ]]; then
+  hint "Public base URL when SpoolSync is served through a reverse proxy, e.g."
+  hint "https://spoolsync.example.com. Used for the OIDC callback; blank = detect per request."
+  ask PUBLIC_URL "Public URL (blank = auto, - to clear)" "$PUBLIC_URL" v_optional_url
+
+
   ask POLL_SECONDS "Printer polling interval in seconds" "$(( PRINTER_POLL_INTERVAL_MS / 1000 ))" v_seconds
   PRINTER_POLL_INTERVAL_MS=$(( POLL_SECONDS * 1000 ))
 
   hint "Syslog target pushed to PrusaLink 'buddy' firmware printers (host or host:port)."
-  ask SYSLOG_HOST "Syslog host (blank to skip)" "$SYSLOG_HOST" v_optional_host
+  ask SYSLOG_HOST "Syslog host (blank to skip, - to clear)" "$SYSLOG_HOST" v_optional_host
 
   hint "Browserless WebSocket URL for the work-in-progress PrusaConnect login."
-  ask BROWSERLESS_URL "Browserless URL (blank to skip)" "$BROWSERLESS_URL" v_optional_host
-
-  hint "Use 127.0.0.1 when a reverse proxy on this host terminates HTTPS."
-  ask FRONTEND_BIND "Web UI bind address" "$FRONTEND_BIND" v_bind
+  ask BROWSERLESS_URL "Browserless URL (blank to skip, - to clear)" "$BROWSERLESS_URL" v_optional_host
 
   hint "'build' compiles images from this checkout. 'pull' downloads ghcr.io images,"
   hint "which may require 'docker login ghcr.io' if they are not public."
@@ -408,8 +569,13 @@ mask() { [[ " ${GENERATED[*]} " == *" $1 "* ]] && echo "(generated)" || echo "(s
 
 section "Summary"
 cat <<EOF
+  Hostname            ${SPOOLSYNC_HOSTNAME}
+  Public URL          ${PUBLIC_URL:-auto}
   Web UI              ${FRONTEND_BIND}:${FRONTEND_PORT}
   Backend API         ${BACKEND_BIND}:${BACKEND_PORT}
+  ESP32 server host   ${ESP32_SERVER_HOST:-n/a (API not exposed)}
+  Database            $([[ $SPOOLSYNC_DB_MODE == external ]] && echo "external ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}" || echo "bundled (${POSTGRES_USER}/${POSTGRES_DB})")
+  Database published  $([[ $POSTGRES_PUBLISH == y ]] && echo "${POSTGRES_PUBLISH_BIND}:${POSTGRES_PUBLISH_PORT}" || echo no)
   Database password   $(mask POSTGRES_PASSWORD)
   Session secret      $(mask JWT_SECRET)
   Session lifetime    ${JWT_EXPIRES_IN}
@@ -468,19 +634,20 @@ fi
 # ── Done ─────────────────────────────────────────────────────────────────────
 port_suffix="$([[ $FRONTEND_PORT == 80 ]] || echo ":$FRONTEND_PORT")"
 section "SpoolSync is running"
-if [[ $FRONTEND_BIND == 127.0.0.1 ]]; then
-  echo "  http://127.0.0.1${port_suffix}  (local only; point your reverse proxy here)"
+[[ -n $PUBLIC_URL ]] && echo "  ${PUBLIC_URL}"
+if [[ $FRONTEND_BIND == 127.* ]]; then
+  echo "  http://${FRONTEND_BIND}${port_suffix}  (local only; point your reverse proxy here)"
+elif [[ $FRONTEND_BIND != 0.0.0.0 ]]; then
+  echo "  http://${SPOOLSYNC_HOSTNAME}${port_suffix}"
+  [[ $SPOOLSYNC_HOSTNAME != "$FRONTEND_BIND" ]] && echo "  http://${FRONTEND_BIND}${port_suffix}"
 else
-  # LAN IPv4 addresses, skipping Docker's own bridge interfaces.
-  if command -v ip >/dev/null 2>&1; then
-    addrs="$(ip -4 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth)/ { sub(/\/.*/, "", $4); print $4 }')"
-  else
-    addrs="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v ':' || true)"
-  fi
-  for host in $(hostname -f 2>/dev/null || hostname) $addrs; do
-    echo "  http://${host}${port_suffix}"
+  echo "  http://${SPOOLSYNC_HOSTNAME}${port_suffix}"
+  for ip in "${HOST_IPS[@]}"; do
+    [[ $ip != "$SPOOLSYNC_HOSTNAME" ]] && echo "  http://${ip}${port_suffix}"
   done
 fi
+[[ -n $ESP32_SERVER_HOST ]] && echo "  ESP32 provisioning will default to host ${ESP32_SERVER_HOST} (API port ${BACKEND_PORT})"
+[[ $POSTGRES_PUBLISH == y ]] && echo "  Database: ${POSTGRES_PUBLISH_BIND}:${POSTGRES_PUBLISH_PORT} (user ${POSTGRES_USER}, db ${POSTGRES_DB})"
 if [[ $CREATE_ADMIN == y ]]; then
   echo
   echo "  Log in as:  ${BOLD}${ADMIN_EMAIL}${RESET}"

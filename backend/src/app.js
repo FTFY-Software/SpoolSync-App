@@ -27,6 +27,7 @@ app.use('/api/v1', apiRoutes);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/version', (_req, res) => res.json({ version: process.env.APP_VERSION || 'dev' }));
+app.get('/api/client-config', (_req, res) => res.json({ esp32ServerHost: process.env.ESP32_SERVER_HOST || null }));
 
 app.use(notFoundHandler);
 app.use(errorHandler);

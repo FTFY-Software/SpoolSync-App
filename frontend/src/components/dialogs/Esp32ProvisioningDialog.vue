@@ -114,10 +114,20 @@ const form = reactive({
   host: window.location.hostname,
 });
 
+// Server-configured host (ESP32_SERVER_HOST) wins over the address-bar
+// hostname, which devices may not be able to resolve (e.g. behind a proxy).
+const defaultHost = ref(window.location.hostname);
+
 const LS_SSID_KEY = 'spoolsync:wifi:ssid';
 const LS_PASS_KEY = 'spoolsync:wifi:password';
 
 onMounted(() => {
+  fetch('/api/client-config').then(r => r.json()).then(data => {
+    if (!data.esp32ServerHost) return;
+    if (form.host === defaultHost.value) form.host = data.esp32ServerHost;
+    defaultHost.value = data.esp32ServerHost;
+  }).catch(() => {});
+
   const savedSsid = localStorage.getItem(LS_SSID_KEY);
   const savedPass = localStorage.getItem(LS_PASS_KEY);
   if (savedSsid !== null) {
@@ -224,7 +234,7 @@ function close() {
   statusMessage.value = '';
   errorMessage.value = '';
   form.deviceName = '';
-  form.host = window.location.hostname;
+  form.host = defaultHost.value;
   if (!saveWifi.value) {
     form.ssid = '';
     form.password = '';
