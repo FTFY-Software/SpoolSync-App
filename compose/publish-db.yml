@@ -1,0 +1,6 @@
+# Publish the bundled PostgreSQL on the host (for backups or admin tools).
+# Enable with COMPOSE_FILE=docker-compose.yml:compose/publish-db.yml.
+services:
+  postgres:
+    ports:
+      - "${POSTGRES_PUBLISH_BIND:-127.0.0.1}:${POSTGRES_PUBLISH_PORT:-5432}:5432"

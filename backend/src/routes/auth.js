@@ -8,10 +8,12 @@ import { authenticate, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
 
-// Derive the callback URL from the live request so it always matches the
-// external hostname (uses X-Forwarded-Host / X-Forwarded-Proto via trust proxy).
+// Use PUBLIC_URL when set; otherwise derive the callback URL from the live
+// request so it matches the external hostname (uses X-Forwarded-Host /
+// X-Forwarded-Proto via trust proxy).
 function callbackUrlFor(req) {
-  return `${req.protocol}://${req.hostname}/api/v1/auth/oidc/callback`;
+  const base = process.env.PUBLIC_URL?.replace(/\/+$/, '') || `${req.protocol}://${req.hostname}`;
+  return `${base}/api/v1/auth/oidc/callback`;
 }
 
 // ── Public: OIDC status ────────────────────────────────────────────────────

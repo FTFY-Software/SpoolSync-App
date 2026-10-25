@@ -1,0 +1,9 @@
+# Use an external PostgreSQL server instead of the bundled container.
+# Enable with COMPOSE_FILE=docker-compose.yml:compose/external-db.yml and set
+# POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD.
+# Requires Docker Compose 2.24+ (for !reset).
+services:
+  backend:
+    depends_on: !reset {}
+  postgres:
+    profiles: ["bundled-db"]
