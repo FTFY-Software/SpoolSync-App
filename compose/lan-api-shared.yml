@@ -1,0 +1,10 @@
+# Serve the backend API on the web UI's LAN address (port 3000): the frontend's
+# nginx gets a second listener that proxies to the backend. The whole stack then
+# needs a single LAN IP, and the backend stays on the private network.
+# Load after compose/lan-network.yml. Requires Docker Compose 2.24+ (for !reset).
+services:
+  frontend:
+    volumes:
+      - ./frontend/api-proxy.conf.template:/etc/nginx/templates/api-proxy.conf.template:ro
+  backend:
+    ports: !reset []
